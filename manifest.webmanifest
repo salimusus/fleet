@@ -1,0 +1,37 @@
+{
+  "name": "FleetCare",
+  "short_name": "FleetCare",
+  "description": "Suivi d'entretien Poids Lourds — BEST TRANSPORT",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0a1628",
+  "theme_color": "#0a1628",
+  "lang": "fr",
+  "categories": ["business", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "share_target": {
+    "action": "./",
+    "method": "GET",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": {
+      "title": "sharedTitle",
+      "text": "sharedText",
+      "url": "sharedUrl"
+    }
+  }
+}
