@@ -3342,16 +3342,31 @@ tr:last-child td { border-bottom: none; }
             </svg>
             <div style="flex:1">
               <div style="font-weight:700;font-size:14px;color:var(--accent)">📦 Import Bon de Livraison / Facture fournisseur</div>
-              <div style="font-size:11px;color:var(--text-secondary)">Photographiez un BL ou une facture avec Google Lens (ou téléchargez une image), collez le texte ici → tous les champs se remplissent automatiquement (réf, désignation, qté, prix, fournisseur)</div>
+              <div style="font-size:11px;color:var(--text-secondary)">Prenez une photo du BL → l'application lit automatiquement et remplit les champs (réf, désignation, qté, prix, fournisseur)</div>
             </div>
           </div>
-          <textarea id="s_blPaste" class="form-textarea" rows="4"
-            placeholder="📋 Collez ici le texte d'un bon de livraison ou d'une facture fournisseur...&#10;&#10;Exemples reconnus :&#10;• MP Truck TODD&#10;• Hesus, Geodis, Mister Auto, Oscaro Pro&#10;• Concessionnaires Renault Trucks, Volvo, Mercedes, MAN, DAF...&#10;• Tout BL avec REFERENCE / DESIGNATION / QTE / PU / MONTANT"
+
+          <!-- 📸 BOUTON PRINCIPAL : PRENDRE UNE PHOTO DU BL -->
+          <button type="button" onclick="captureBLPhoto()" class="btn" style="width:100%;background:var(--accent);color:var(--bg-primary);font-size:15px;padding:16px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;justify-content:center;gap:10px">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:24px;height:24px">
+              <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
+              <circle cx="12" cy="13" r="4"/>
+            </svg>
+            📸 PRENDRE UNE PHOTO DU BL
+          </button>
+
+          <!-- Input fichier caché pour capture photo (caméra arrière) -->
+          <input type="file" id="s_blPhotoInput" accept="image/*" capture="environment" style="display:none" onchange="onBLPhotoSelected(event)">
+
+          <div style="text-align:center;font-size:11px;color:var(--text-muted);margin-bottom:10px">— ou —</div>
+
+          <textarea id="s_blPaste" class="form-textarea" rows="3"
+            placeholder="📋 Vous pouvez aussi coller le texte d'un BL copié depuis Google Lens..."
             style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-primary);width:100%;border:2px dashed var(--accent)"
             oninput="blAutoFill()"></textarea>
           <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
-            <button type="button" onclick="blManualFill()" class="btn" style="flex:1;min-width:200px;background:var(--accent);color:var(--bg-primary);font-size:12px;padding:10px;font-weight:700">
-              ✨ EXTRAIRE LES PIÈCES DU BL
+            <button type="button" onclick="blManualFill()" class="btn" style="flex:1;min-width:200px;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--accent);font-size:12px;padding:10px;font-weight:700">
+              ✨ EXTRAIRE LE TEXTE COLLÉ
             </button>
             <button type="button" onclick="document.getElementById('s_blPaste').value=''" class="btn btn-secondary" style="font-size:11px;padding:10px">
               ✕ Effacer
@@ -10179,6 +10194,165 @@ function parseBonLivraison(text) {
 // ============================================================
 // === REMPLISSAGE AUTO DEPUIS BON DE LIVRAISON ===
 // ============================================================
+
+// ============================================================
+// === 📸 CAPTURE PHOTO DU BL + OCR AUTOMATIQUE ===
+// ============================================================
+
+// Déclenche l'ouverture de la caméra (via input file capture)
+function captureBLPhoto() {
+  const input = document.getElementById('s_blPhotoInput');
+  if (input) {
+    input.value = ''; // reset pour permettre de reprendre la même photo
+    input.click();
+  }
+}
+
+// Appelé quand une photo est prise/sélectionnée
+async function onBLPhotoSelected(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+
+  // Vérifier que Tesseract est disponible
+  if (typeof Tesseract === 'undefined') {
+    showToast('⚠ Module OCR non chargé. Vérifiez votre connexion internet et réessayez.', true);
+    return;
+  }
+
+  // Afficher un overlay de progression
+  showBLOCRProgress(0, 'Préparation de l\'image...');
+
+  try {
+    // Charger l'image dans un canvas
+    const img = await loadImageFromFile(file);
+    const canvas = imageToCanvas(img);
+
+    showBLOCRProgress(0.1, 'Lecture du bon de livraison...');
+
+    // OCR en mode document (français), PSM 4 = colonnes de texte de tailles variables
+    const ocrResult = await performProfessionalOCR(canvas, {
+      lang: 'fra+eng',
+      psm: 4, // Assume a single column of text of variable sizes (idéal pour un BL)
+      onProgress: (progress, attemptName) => {
+        showBLOCRProgress(0.1 + progress * 0.85, `Lecture en cours... (${attemptName})`);
+      }
+    });
+
+    showBLOCRProgress(0.97, 'Analyse des pièces...');
+
+    const text = (ocrResult.text || '').trim();
+    console.log('[BL Photo] Texte OCR:', text);
+
+    hideBLOCRProgress();
+
+    if (!text || text.length < 10) {
+      showToast('⚠ Texte illisible sur la photo. Reprenez la photo bien à plat, avec un bon éclairage.', true);
+      return;
+    }
+
+    // Mettre le texte OCR dans la zone (visible pour vérification/correction)
+    const blArea = document.getElementById('s_blPaste');
+    if (blArea) blArea.value = text;
+
+    // Lancer le parsing
+    const parsed = parseBonLivraison(text);
+    console.log('[BL Photo] Parsé:', parsed);
+
+    if (!parsed.lines || parsed.lines.length === 0) {
+      let hint = '⚠ Aucune pièce détectée sur la photo.';
+      if (parsed.supplier) hint += `\n\n✓ Fournisseur reconnu : ${parsed.supplier}`;
+      hint += '\n\n💡 Le texte lu est affiché dans la zone ci-dessous. Vous pouvez le corriger puis appuyer sur "Extraire le texte collé". Pour une meilleure lecture : photo bien à plat, éclairage uniforme.';
+      showToast(hint, true);
+      return;
+    }
+
+    // Confiance OCR faible : prévenir l'utilisateur
+    if (ocrResult.confidence && ocrResult.confidence < 55) {
+      showToast(`⚠ Lecture de qualité moyenne (${Math.round(ocrResult.confidence)}%). Vérifiez bien les références extraites.`, true);
+    }
+
+    // Si plusieurs lignes : modal de sélection, sinon remplissage direct
+    if (parsed.lines.length > 1) {
+      showBLLinesPicker(parsed);
+    } else {
+      fillStockFromBLLine(parsed.lines[0], parsed);
+    }
+
+  } catch (err) {
+    console.error('[BL Photo] Erreur:', err);
+    hideBLOCRProgress();
+    showToast('❌ Erreur lors de la lecture : ' + err.message, true);
+  }
+}
+
+// Charger un fichier image en objet Image
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Image illisible'));
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error('Lecture du fichier impossible'));
+    reader.readAsDataURL(file);
+  });
+}
+
+// Convertir une Image en canvas (avec limitation de taille pour la performance)
+function imageToCanvas(img) {
+  const canvas = document.createElement('canvas');
+  // Limiter la taille max pour que l'OCR reste rapide tout en gardant la lisibilité
+  const MAX_DIM = 2000;
+  let w = img.naturalWidth || img.width;
+  let h = img.naturalHeight || img.height;
+
+  if (w > MAX_DIM || h > MAX_DIM) {
+    const ratio = Math.min(MAX_DIM / w, MAX_DIM / h);
+    w = Math.round(w * ratio);
+    h = Math.round(h * ratio);
+  }
+
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, w, h);
+  return canvas;
+}
+
+// Overlay de progression OCR
+function showBLOCRProgress(progress, message) {
+  let overlay = document.getElementById('blOCRProgressOverlay');
+  if (!overlay) {
+    const html = `
+      <div id="blOCRProgressOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:2000;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:20px">
+        <div style="background:var(--bg-secondary);border-radius:16px;padding:32px;max-width:400px;width:100%;text-align:center;border:1px solid var(--border)">
+          <div style="font-size:48px;margin-bottom:16px">📸</div>
+          <div style="font-size:18px;font-weight:700;color:var(--text-primary);margin-bottom:8px">Lecture du bon de livraison</div>
+          <div id="blOCRMessage" style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">Préparation...</div>
+          <div style="background:var(--bg-primary);border-radius:99px;height:10px;overflow:hidden">
+            <div id="blOCRBar" style="background:var(--accent);height:100%;width:0%;transition:width 0.3s;border-radius:99px"></div>
+          </div>
+          <div id="blOCRPercent" style="font-size:12px;color:var(--text-muted);margin-top:8px">0%</div>
+        </div>
+      </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    overlay = document.getElementById('blOCRProgressOverlay');
+  }
+  const bar = document.getElementById('blOCRBar');
+  const msg = document.getElementById('blOCRMessage');
+  const pct = document.getElementById('blOCRPercent');
+  const percent = Math.round(progress * 100);
+  if (bar) bar.style.width = percent + '%';
+  if (msg && message) msg.textContent = message;
+  if (pct) pct.textContent = percent + '%';
+}
+
+function hideBLOCRProgress() {
+  const overlay = document.getElementById('blOCRProgressOverlay');
+  if (overlay) overlay.remove();
+}
 
 function blAutoFill() {
   const area = document.getElementById('s_blPaste');
