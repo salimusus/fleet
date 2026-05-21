@@ -3342,7 +3342,7 @@ tr:last-child td { border-bottom: none; }
             </svg>
             <div style="flex:1">
               <div style="font-weight:700;font-size:14px;color:var(--accent)">📦 Import Bon de Livraison / Facture fournisseur</div>
-              <div style="font-size:11px;color:var(--text-secondary)">Prenez une photo du BL → l'application lit automatiquement et remplit les champs (réf, désignation, qté, prix, fournisseur)</div>
+              <div style="font-size:11px;color:var(--text-secondary)">Prenez une photo du BL → reconnaissance intelligente automatique qui remplit les champs (réf, désignation, qté, prix, catégorie, fournisseur)</div>
             </div>
           </div>
 
@@ -10213,62 +10213,114 @@ async function onBLPhotoSelected(event) {
   const file = event.target.files && event.target.files[0];
   if (!file) return;
 
-  // Vérifier que Tesseract est disponible
-  if (typeof Tesseract === 'undefined') {
-    showToast('⚠ Module OCR non chargé. Vérifiez votre connexion internet et réessayez.', true);
-    return;
-  }
-
   // Afficher un overlay de progression
-  showBLOCRProgress(0, 'Préparation de l\'image...');
+  showBLOCRProgress(0.15, 'Préparation de l\'image...');
 
   try {
-    // Charger l'image dans un canvas
+    // Charger et compresser l'image en base64 (pour l'envoi à l'API)
     const img = await loadImageFromFile(file);
     const canvas = imageToCanvas(img);
+    // Qualité 0.85 = bon compromis lisibilité/taille
+    const base64Data = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+    const mediaType = 'image/jpeg';
 
-    showBLOCRProgress(0.1, 'Lecture du bon de livraison...');
+    showBLOCRProgress(0.35, 'Lecture intelligente du bon de livraison...');
 
-    // OCR en mode document (français), PSM 4 = colonnes de texte de tailles variables
-    const ocrResult = await performProfessionalOCR(canvas, {
-      lang: 'fra+eng',
-      psm: 4, // Assume a single column of text of variable sizes (idéal pour un BL)
-      onProgress: (progress, attemptName) => {
-        showBLOCRProgress(0.1 + progress * 0.85, `Lecture en cours... (${attemptName})`);
-      }
+    // === Appel à l'API Claude Vision ===
+    // Claude lit l'image et retourne directement les pièces en JSON structuré
+    const prompt = `Tu es un assistant spécialisé dans la lecture de bons de livraison et factures de pièces détachées poids lourds.
+
+Analyse cette image de bon de livraison / facture fournisseur et extrais TOUTES les pièces (articles) présentes.
+
+Réponds UNIQUEMENT avec un objet JSON valide (sans texte avant ou après, sans backticks markdown) au format exact suivant :
+{
+  "supplier": "nom du fournisseur (ex: MP Truck TODD, Hesus, etc.) ou null",
+  "blNumber": "numéro de bon de livraison ou facture ou null",
+  "blDate": "date au format AAAA-MM-JJ ou null",
+  "totalTTC": nombre ou null,
+  "lines": [
+    {
+      "ref": "référence article principale (la plus complète, ex: GETR318566037)",
+      "designation": "désignation complète de la pièce",
+      "qty": nombre (quantité),
+      "unit": "unité (PI, U, L, KG...)",
+      "priceHT": nombre (prix unitaire HT) ou null,
+      "category": "UNE de ces valeurs EXACTES selon le type de pièce: FILTRE, HUILE, PNEU, FREIN, ELECTRIQUE, MOTEUR, TRANSMISSION, SUSPENSION, CARROSSERIE, HAYON, FROID, CONSOMMABLE, AUTRE"
+    }
+  ]
+}
+
+Règles importantes :
+- N'inclus PAS les codes administratifs (n° client, n° magasin "MAG", code opérateur "servi par", n° TVA, SIREN, RCS) comme des pièces.
+- Une pièce a une référence article ET une désignation lisible (ex: "M.PIED INF.G.NOIR FH4" = marchepied).
+- Si la même pièce a plusieurs références (ex: GETR318566037 et 318566037), garde la plus complète comme "ref".
+- Pour "category", choisis intelligemment selon la désignation. Ex: "M.PIED" (marchepied) = CARROSSERIE, "FILTRE" = FILTRE, "PLAQUETTE" = FREIN, "AMPOULE" = ELECTRIQUE.
+- Les nombres décimaux utilisent un point (45.98), pas une virgule.
+- Si tu ne trouves aucune pièce, retourne "lines": [].`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1500,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+            { type: "text", text: prompt }
+          ]
+        }]
+      })
     });
 
-    showBLOCRProgress(0.97, 'Analyse des pièces...');
+    showBLOCRProgress(0.85, 'Analyse des pièces...');
 
-    const text = (ocrResult.text || '').trim();
-    console.log('[BL Photo] Texte OCR:', text);
+    if (!response.ok) {
+      throw new Error(`Erreur API (${response.status})`);
+    }
+
+    const data = await response.json();
+    let responseText = (data.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n')
+      .trim();
+
+    console.log('[BL Photo] Réponse Claude:', responseText);
+
+    // Nettoyer d'éventuels backticks markdown
+    responseText = responseText.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (e) {
+      console.error('[BL Photo] JSON invalide:', e);
+      throw new Error('Réponse illisible. Réessayez avec une photo plus nette.');
+    }
 
     hideBLOCRProgress();
 
-    if (!text || text.length < 10) {
-      showToast('⚠ Texte illisible sur la photo. Reprenez la photo bien à plat, avec un bon éclairage.', true);
-      return;
-    }
+    // Normaliser le format pour réutiliser fillStockFromBLLine / showBLLinesPicker
+    parsed.lines = (parsed.lines || []).map(l => ({
+      ref: (l.ref || '').toString().toUpperCase().trim(),
+      designation: (l.designation || '').toString().trim(),
+      qty: l.qty || 1,
+      unit: (l.unit || 'U').toString().toUpperCase(),
+      priceHT: (typeof l.priceHT === 'number') ? l.priceHT : null,
+      totalHT: (typeof l.priceHT === 'number') ? l.priceHT * (l.qty || 1) : null,
+      category: l.category || null  // catégorie déjà choisie par Claude
+    })).filter(l => l.ref || l.designation);
 
-    // Mettre le texte OCR dans la zone (visible pour vérification/correction)
-    const blArea = document.getElementById('s_blPaste');
-    if (blArea) blArea.value = text;
-
-    // Lancer le parsing
-    const parsed = parseBonLivraison(text);
-    console.log('[BL Photo] Parsé:', parsed);
+    parsed.rawText = `📸 Lu par reconnaissance intelligente le ${new Date().toLocaleString('fr-FR')}`;
 
     if (!parsed.lines || parsed.lines.length === 0) {
       let hint = '⚠ Aucune pièce détectée sur la photo.';
       if (parsed.supplier) hint += `\n\n✓ Fournisseur reconnu : ${parsed.supplier}`;
-      hint += '\n\n💡 Le texte lu est affiché dans la zone ci-dessous. Vous pouvez le corriger puis appuyer sur "Extraire le texte collé". Pour une meilleure lecture : photo bien à plat, éclairage uniforme.';
+      hint += '\n\n💡 Reprenez la photo bien à plat, avec un bon éclairage et en cadrant le tableau des pièces.';
       showToast(hint, true);
       return;
-    }
-
-    // Confiance OCR faible : prévenir l'utilisateur
-    if (ocrResult.confidence && ocrResult.confidence < 55) {
-      showToast(`⚠ Lecture de qualité moyenne (${Math.round(ocrResult.confidence)}%). Vérifiez bien les références extraites.`, true);
     }
 
     // Si plusieurs lignes : modal de sélection, sinon remplissage direct
@@ -10281,7 +10333,7 @@ async function onBLPhotoSelected(event) {
   } catch (err) {
     console.error('[BL Photo] Erreur:', err);
     hideBLOCRProgress();
-    showToast('❌ Erreur lors de la lecture : ' + err.message, true);
+    showToast('❌ ' + (err.message || 'Erreur lors de la lecture de la photo'), true);
   }
 }
 
@@ -10460,6 +10512,39 @@ function selectBLLine(idx) {
   fillStockFromBLLine(parsed.lines[idx], parsed);
 }
 
+// ============================================================
+// === DEVINER LA CATÉGORIE STOCK (valeurs du select s_category) ===
+// ============================================================
+// Retourne une valeur EXACTEMENT compatible avec les <option> du select :
+// FILTRE, HUILE, PNEU, FREIN, ELECTRIQUE, MOTEUR, TRANSMISSION, SUSPENSION,
+// CARROSSERIE, HAYON, FROID, CONSOMMABLE, AUTRE
+function guessStockCategory(textUpper) {
+  if (!textUpper) return null;
+  const t = textUpper.toUpperCase()
+    .replace(/É/g,'E').replace(/È/g,'E').replace(/Ê/g,'E').replace(/À/g,'A').replace(/Â/g,'A');
+
+  // Ordre important : du plus spécifique au plus général
+  const rules = [
+    { cat: 'HAYON',       kw: ['HAYON', 'ELEVATEUR', 'DHOLLANDIA', 'BAR CUISSON', 'VERIN HAYON'] },
+    { cat: 'FROID',       kw: ['FRIGO', 'FRIGORIF', 'GROUPE FROID', 'THERMOKING', 'CARRIER', 'COMPRESSEUR FROID', 'EVAPORATEUR'] },
+    { cat: 'FILTRE',      kw: ['FILTRE', 'FILTER', 'CARTOUCHE'] },
+    { cat: 'HUILE',       kw: ['HUILE', 'LUBRIFIANT', 'GRAISSE', 'ADBLUE', 'AD BLUE', 'LIQUIDE', 'ANTIGEL', 'GASOIL'] },
+    { cat: 'PNEU',        kw: ['PNEU', 'PNEUMATIQUE', 'JANTE', 'ROUE', 'CHAMBRE A AIR', 'VALVE GONFLAGE'] },
+    { cat: 'FREIN',       kw: ['PLAQUETTE', 'DISQUE FREIN', 'DISQUE DE FREIN', 'FREIN', 'TAMBOUR', 'MACHOIRE', 'ETRIER', 'GARNITURE', 'KIT FREIN', 'CYLINDRE'] },
+    { cat: 'ELECTRIQUE',  kw: ['AMPOULE', 'PHARE', 'FEU', 'ALTERNATEUR', 'DEMARREUR', 'BATTERIE', 'CAPTEUR', 'FUSIBLE', 'LED', 'ECLAIRAGE', 'BOUGIE', 'PROJECTEUR', 'FAISCEAU', 'RELAIS', 'GYROPHARE', 'CLIGNOTANT', 'SONDE'] },
+    { cat: 'TRANSMISSION',kw: ['COURROIE', 'EMBRAYAGE', 'GALET', 'VOLANT MOTEUR', 'CARDAN', 'BOITE VITESSE', 'BOITE DE VITESSE', 'CROISILLON'] },
+    { cat: 'SUSPENSION',  kw: ['AMORTISSEUR', 'AMORT', 'SUSPENS', 'LAME', 'SOUFFLET', 'SILENT', 'BIELLETTE', 'ROTULE', 'COUSSIN AIR', 'RESSORT', 'DIRECTION', 'BARRE STAB'] },
+    { cat: 'MOTEUR',      kw: ['JOINT', 'DURITE', 'POMPE', 'TURBO', 'INJECT', 'THERMOSTAT', 'RADIATEUR', 'VENTILATEUR', 'CULASSE', 'PISTON', 'SEGMENT', 'VILEBREQUIN', 'SOUPAPE', 'COURROIE DISTRIB'] },
+    { cat: 'CARROSSERIE', kw: ['PARE-CHOC', 'PARE CHOC', 'BAVETTE', 'VITRE', 'RETRO', 'RETROVISEUR', 'BACHE', 'AILE', 'M.PIED', 'MARCHEPIED', 'MARCHE PIED', 'MARCHE-PIED', 'PIED INF', 'CALANDRE', 'CAPOT', 'PORTE', 'POIGNEE', 'SERRURE', 'CABINE', 'GARDE BOUE', 'GARDE-BOUE', 'DEFLECTEUR'] },
+    { cat: 'CONSOMMABLE', kw: ['SANGLE', 'PALETTE', 'CHIFFON', 'GANT', 'COLLIER', 'VIS', 'BOULON', 'ECROU', 'RONDELLE', 'RUBAN', 'NETTOYANT', 'SPRAY', 'AEROSOL', 'SCOTCH'] }
+  ];
+
+  for (const r of rules) {
+    if (r.kw.some(k => t.includes(k))) return r.cat;
+  }
+  return null; // Laisser l'utilisateur choisir si rien trouvé
+}
+
 function fillStockFromBLLine(line, parsed) {
   let filledCount = 0;
 
@@ -10502,27 +10587,21 @@ function fillStockFromBLLine(line, parsed) {
     fillField('s_unit', mappedUnit, true);
   }
 
-  // 6) Catégorie auto basée sur la désignation
-  const desigUpper = (line.designation || '').toUpperCase();
-  if (desigUpper) {
-    const catMap = {
-      'FILTRE': ['FILTRE'],
-      'HUILE': ['HUILE', 'LUBRIFIANT', 'GRAISSE', 'ADBLUE'],
-      'FREINAGE': ['PLAQUETTE', 'DISQUE', 'FREIN', 'TAMBOUR', 'VALVE FREIN', 'ETRIER', 'MACHOIRE'],
-      'PNEUMATIQUE': ['PNEU', 'JANTE', 'ROUE', 'VALVE PNEU'],
-      'ELECTRICITE': ['AMPOULE', 'PHARE', 'FEU', 'ALTERNATEUR', 'DEMARREUR', 'BATTERIE', 'CAPTEUR', 'FUSIBLE', 'LED', 'ECLAIRAGE', 'BOUGIE', 'PROJECTEUR'],
-      'TRANSMISSION': ['COURROIE', 'EMBRAYAGE', 'GALET', 'VOLANT MOTEUR', 'CARDAN'],
-      'SUSPENSION': ['AMORTISSEUR', 'AMORT.', 'SUSPENS', 'LAME', 'SOUFFLET', 'SILENT', 'BIELLETTE'],
-      'MOTEUR': ['JOINT', 'DURITE', 'POMPE', 'TURBO', 'INJECT', 'THERMOSTAT', 'RADIATEUR', 'VENTILATEUR'],
-      'ECHAPPEMENT': ['ECHAP', 'SILENC', 'CATAL'],
-      'CARROSSERIE': ['PARE-CHOC', 'BAVETTE', 'VITRE', 'RETRO', 'BACHE', 'AILE', 'M.PIED', 'MARCHEPIED', 'MARCHE PIED', 'CALANDRE', 'CAPOT', 'PORTE'],
-      'EQUIPEMENT': ['HAYON', 'SANGLE', 'PALETTE', 'FRIGO']
-    };
-    for (const [cat, keywords] of Object.entries(catMap)) {
-      if (keywords.some(k => desigUpper.includes(k))) {
-        fillField('s_category', cat, true);
-        break;
-      }
+  // 6) Catégorie auto
+  // Priorité 1 : catégorie déjà déterminée par Claude Vision (la plus fiable)
+  // Priorité 2 : déduction depuis la désignation
+  // IMPORTANT : les valeurs DOIVENT correspondre aux <option> du select s_category :
+  // FILTRE, HUILE, PNEU, FREIN, ELECTRIQUE, MOTEUR, TRANSMISSION, SUSPENSION,
+  // CARROSSERIE, HAYON, FROID, CONSOMMABLE, AUTRE
+  const validCats = ['FILTRE','HUILE','PNEU','FREIN','ELECTRIQUE','MOTEUR','TRANSMISSION','SUSPENSION','CARROSSERIE','HAYON','FROID','CONSOMMABLE','AUTRE'];
+  if (line.category && validCats.includes(line.category)) {
+    fillField('s_category', line.category, true);
+  } else {
+    const desigUpper = (line.designation || '').toUpperCase()
+      .replace(/É/g,'E').replace(/È/g,'E').replace(/Ê/g,'E').replace(/À/g,'A').replace(/Â/g,'A');
+    if (desigUpper) {
+      const cat = guessStockCategory(desigUpper);
+      if (cat) fillField('s_category', cat, true);
     }
   }
 
@@ -10626,30 +10705,11 @@ function stockLensManualFill() {
   }
 
   // === 5) CATÉGORIE auto ===
-  if (parsed.category) {
-    fillField('s_category', parsed.category, true);
-  } else if (parsed.type) {
-    const catMap = {
-      'FILTRE': ['FILTRE'],
-      'HUILE': ['HUILE', 'ADBLUE', 'LUBRIFIANT', 'GRAISSE'],
-      'FREINAGE': ['PLAQUETTE', 'DISQUE', 'FREIN', 'TAMBOUR', 'VALVE', 'ETRIER'],
-      'PNEUMATIQUE': ['PNEU', 'JANTE', 'ROUE'],
-      'ELECTRICITE': ['AMPOULE', 'PHARE', 'FEU', 'ALTERNATEUR', 'DEMARREUR', 'BATTERIE', 'CAPTEUR', 'FUSIBLE', 'LED', 'ECLAIRAGE', 'BOUGIE'],
-      'TRANSMISSION': ['COURROIE', 'EMBRAYAGE', 'GALET', 'VOLANT'],
-      'SUSPENSION': ['AMORT', 'SUSPENS', 'LAME', 'SOUFFLET', 'SILENT'],
-      'MOTEUR': ['JOINT', 'DURITE', 'POMPE', 'TURBO', 'INJECT', 'THERMOSTAT', 'RADIATEUR', 'VENTILATEUR'],
-      'ECHAPPEMENT': ['ECHAP', 'SILENC', 'CATAL'],
-      'CARROSSERIE': ['PARE-CHOC', 'BAVETTE', 'VITRE', 'RETRO', 'BACHE', 'AILE'],
-      'EQUIPEMENT': ['HAYON', 'SANGLE', 'PALETTE', 'FRIGO']
-    };
-    const upperType = parsed.type.toUpperCase()
-      .replace(/É/g, 'E').replace(/È/g, 'E').replace(/À/g, 'A').replace(/Â/g, 'A');
-    for (const [cat, keywords] of Object.entries(catMap)) {
-      if (keywords.some(k => upperType.includes(k))) {
-        fillField('s_category', cat, true);
-        break;
-      }
-    }
+  // Utilise la fonction centralisée (valeurs compatibles avec le select)
+  const catText = (parsed.type || '') + ' ' + (parsed.description || '') + ' ' + (parsed.code || '');
+  const guessedCat = guessStockCategory(catText.toUpperCase());
+  if (guessedCat) {
+    fillField('s_category', guessedCat, true);
   }
 
   // === 6) PRIX ===
