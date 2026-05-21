@@ -9865,7 +9865,9 @@ function parseBonLivraison(text) {
   const refPatterns = [
     /\b(GETR\d{9,12})\b/i,          // Truck Todd : GETR318566037
     /\b(\d{9,12})\b/,                // Référence numérique 9-12 chiffres
-    /\b([A-Z]{2,4}\d{6,10})\b/i,    // PAL27, OE12345, etc.
+    /\b(\d{6,8})\b/,                 // Référence numérique 6-8 chiffres (Mann 2992544, etc.)
+    /\b([A-Z]{2,4}[\s\-]?\d{4,10})\b/i,  // PAL27, OE12345, BL2024-5847, etc.
+    /\b([A-Z0-9]{3,6}[\-\.][A-Z0-9]{2,8})\b/i, // Réf avec tiret/point : ABC-1234, 12.345.67
     /\b(P5\d{5})\b/i,                // Donaldson
     /\b(WK\s?\d{2,5}\/?\d*[A-Z]?)\b/i, // Mann
     /\b(E\d{1,3}[A-Z]{1,3}\s?[A-Z]?\d{1,3}[A-Z]?)\b/i, // Hengst E57KP
@@ -9888,6 +9890,10 @@ function parseBonLivraison(text) {
     if (/T[ée]l\s*[:.]/i.test(line) || /\bFax\s*[:.]/i.test(line)) continue;
     // Exclure les en-têtes d'adresse
     if (/^(?:ADRESSE|BEST\s+TRANSPORT|MP\s+TRUCK|FR\d{10,12})/i.test(line)) continue;
+    // Exclure ligne de n° BL/facture et mentions légales
+    if (/\b(?:BON\s+DE\s+LIVRAISON|N[°o]\s*BL|FACTURE\s+N|N[°o]\s*FACTURE)\b/i.test(line)) continue;
+    if (/\bTVA\b|\bRCS\b|\bSIREN\b|\bSIRET\b|\bNAF\b/i.test(line)) continue;
+    if (/CAPITAL\s+(?:SOCIAL|DE)/i.test(line)) continue;
 
     // Chercher une référence article dans cette ligne
     let refFound = null;
@@ -9983,6 +9989,178 @@ function parseBonLivraison(text) {
   }
 
   // ============================================================
+  // 4bis) === MODE DE SECOURS : extraction souple ===
+  // ============================================================
+  // Si la méthode stricte n'a rien trouvé, on tente une extraction plus tolérante :
+  // on cherche TOUTES les références plausibles + TOUS les prix dans le texte,
+  // et on associe par proximité.
+  if (result.lines.length === 0) {
+    console.log('[parseBL] Aucune ligne stricte → MODE SECOURS');
+
+    // Lignes à ignorer (en-têtes, adresses, mentions légales, codes administratifs)
+    const isJunkLine = (l) => {
+      return /^(?:REFERENCE|DESIGNATION|QTE|QUANTITE|U\.V|U\.T|REMISE|MONTANT|TOTAL|BASE|TAUX|TVA|CODE|ADRESSE|SOCIETE|SOCI[ÉE]T[ÉE]|SIRET|SIREN|RCS|NAF|CAPITAL|SIEGE|S[IÈ]EGE|TEL|FAX|MAIL|EMAIL|WWW|HTTP|ALLIANCE|GROUP|GROUPE|UNE\s+SOCI|CLIENT|LIVRAISON|FACTURATION|PAIEMENT|REGLEMENT|R[ÈE]GLEMENT|DATE|PAGE|MERCI|CONDITIONS|ESCOMPTE|IBAN|BIC|BANQUE|BON\s+DE|MAG|MTVA|MODE\s+DE|VOTRE\s+R[ÉE]F)\b/i.test(l)
+        || /\b(?:BON\s+DE\s+LIVRAISON|N[°o]\s*BL|FACTURE\s+N|N[°o]\s*FACTURE)\b/i.test(l)  // ligne de n° BL/facture
+        || /VOUS\s+AVEZ\s+ETE\s+SERVI/i.test(l)  // "Vous avez ete servi par"
+        || /SERVI\s+PAR/i.test(l)
+        || /\bTVA\b/i.test(l)  // toute ligne avec TVA
+        || /\bRCS\b|\bSIREN\b|\bSIRET\b|\bNAF\b|\bAPE\b/i.test(l)  // mentions légales
+        || /CAPITAL\s+(?:SOCIAL|DE)/i.test(l)
+        || /^\d{5}\s+[A-Z]/.test(l)  // code postal + ville
+        || /FR\s?\d{2}\s?\d{3}\s?\d{3}\s?\d{3}/i.test(l)  // n° TVA intracom
+        || /CECI\s+N'EST\s+PAS\s+UNE\s+FACTURE/i.test(l)
+        || /^\d{2}:\d{2}/.test(l)  // heure (16:28)
+        || l.length < 4;
+    };
+
+    // 1) Collecter toutes les références candidates avec leur n° de ligne
+    const refCandidates = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (isJunkLine(line)) continue;
+
+      for (const refRe of refPatterns) {
+        const matches = [...line.matchAll(new RegExp(refRe.source, 'gi'))];
+        for (const m of matches) {
+          const candidate = m[1].trim().toUpperCase().replace(/\s+/g, ' ');
+          // Filtres anti-faux-positifs
+          if (/^0[1-9]\d{8}$/.test(candidate)) continue;  // téléphone
+          if (/^\d{5}$/.test(candidate)) continue;          // code postal
+          if (/^FR\d{11}$/i.test(candidate)) continue;      // TVA
+          if (/^\d{9}$/.test(candidate) && /RCS|SIREN|SIRET/i.test(line)) continue; // SIREN/SIRET
+          // Codes administratifs : commence par 000 (code magasin/opérateur type 00016071, 00016671)
+          if (/^0{2,}\d+$/.test(candidate)) continue;
+          // Code numérique de 6-8 chiffres SANS lettre, sur une ligne qui contient surtout des codes (pas une vraie réf article)
+          if (candidate.length < 5) continue;
+          // Doit avoir au moins une lettre OU faire au moins 9 chiffres
+          // (les vraies réfs article PL sont longues : GETR318566037, 318566037)
+          if (!/[A-Z]/.test(candidate) && candidate.replace(/\D/g,'').length < 8) continue;
+
+          refCandidates.push({ ref: candidate, lineIdx: i, line: line });
+        }
+      }
+    }
+
+    // 2) Fusionner les références qui désignent LA MÊME pièce
+    // Critères de fusion :
+    //   - Réfs sur lignes adjacentes (≤4 lignes), OU
+    //   - Réfs partageant une longue séquence de chiffres commune (gère les variations OCR :
+    //     SETR316566037, 318566037, GETR318566037 partagent "8566037" / "566037")
+    const digitsOf = (s) => s.replace(/\D/g, '');
+    // Plus longue sous-chaîne commune de chiffres
+    const longestCommonDigits = (a, b) => {
+      const da = digitsOf(a), db = digitsOf(b);
+      let best = 0;
+      for (let i = 0; i < da.length; i++) {
+        for (let j = i + 1; j <= da.length; j++) {
+          const sub = da.substring(i, j);
+          if (sub.length > best && db.includes(sub)) best = sub.length;
+        }
+      }
+      return best;
+    };
+    const refGroups = [];
+    for (const rc of refCandidates) {
+      let group = refGroups.find(g =>
+        g.refs.some(r => {
+          // Partagent au moins 6 chiffres consécutifs ET dans une fenêtre de 6 lignes
+          const sharedDigits = longestCommonDigits(r.ref, rc.ref) >= 6 &&
+            Math.abs(r.lineIdx - rc.lineIdx) <= 6;
+          // OU adjacentes (≤4 lignes, cas Lens qui empile ref/colis/désignation/prix)
+          const adjacent = Math.abs(r.lineIdx - rc.lineIdx) <= 4;
+          return sharedDigits || adjacent;
+        })
+      );
+      if (group) {
+        group.refs.push(rc);
+        group.minLine = Math.min(group.minLine, rc.lineIdx);
+        group.maxLine = Math.max(group.maxLine, rc.lineIdx);
+      } else {
+        refGroups.push({ refs: [rc], minLine: rc.lineIdx, maxLine: rc.lineIdx });
+      }
+    }
+
+    // 3) Pour chaque groupe, extraire UNE pièce avec désignation + prix dans la fenêtre élargie
+    for (const group of refGroups) {
+      // Référence principale : la plus "riche" (avec lettres de préférence, sinon la plus longue)
+      const sortedRefs = group.refs.slice().sort((a, b) => {
+        const aHasLetter = /[A-Z]/.test(a.ref) ? 1 : 0;
+        const bHasLetter = /[A-Z]/.test(b.ref) ? 1 : 0;
+        if (aHasLetter !== bHasLetter) return bHasLetter - aHasLetter;
+        return b.ref.length - a.ref.length;
+      });
+      const mainRef = sortedRefs[0].ref;
+      // Les autres réfs du groupe = références équivalentes (notées en cross-ref)
+      const otherRefs = sortedRefs.slice(1).map(r => r.ref);
+
+      let designation = '';
+      let priceHT = null;
+      let qty = 1;
+      let unitCode = 'U';
+
+      // Fenêtre de recherche élargie : depuis la 1ère ref jusqu'à 5 lignes après la dernière ref
+      const windowStart = group.minLine;
+      const windowEnd = Math.min(group.maxLine + 5, lines.length - 1);
+
+      // Chercher la désignation : la ligne la plus "texte" dans la fenêtre
+      // (contient surtout des lettres, peu de chiffres, n'est pas une junk line)
+      for (let j = windowStart; j <= windowEnd; j++) {
+        const l = lines[j];
+        if (isJunkLine(l)) continue;
+        // Ne pas prendre une ligne qui est une référence pure
+        if (refPatterns.some(re => { const m = l.match(re); return m && m[0].length >= l.trim().length - 2; })) continue;
+        // Compter lettres vs chiffres
+        const letters = (l.match(/[A-Za-zÀ-ÿ]/g) || []).length;
+        const digits = (l.match(/\d/g) || []).length;
+        // Une désignation a beaucoup de lettres (ex: "M.PIED INF.G. NOIR FHE")
+        if (letters >= 4 && letters > digits) {
+          // Nettoyer : enlever les prix/qty éventuels en fin
+          let desig = l.replace(/\d{1,5}[,\.]\d{2}.*$/, '').trim();
+          desig = desig.replace(/\s+(PI|U|KG|L|ML|G)\s*$/i, '').trim();
+          if (desig.length >= 4) {
+            designation = desig.substring(0, 60);
+            break;
+          }
+        }
+      }
+
+      // Chercher le prix HT : 1er prix décimal dans la fenêtre
+      for (let j = windowStart; j <= windowEnd; j++) {
+        const priceMatch = lines[j].match(/(\d{1,5}[,\.]\d{2})\b/);
+        if (priceMatch) {
+          const p = parseFloat(priceMatch[1].replace(',', '.'));
+          if (p >= 0.10 && p < 100000) { priceHT = p; break; }
+        }
+      }
+
+      // Chercher quantité + unité (ex: "1 PI") — éviter de confondre avec la décimale d'un prix
+      for (let j = windowStart; j <= windowEnd; j++) {
+        // Quantité = petit entier (1-99) suivi d'une unité, PAS précédé d'une virgule/point (sinon c'est une décimale de prix)
+        const unitMatch = lines[j].match(/(?:^|[^,\.\d])([1-9]\d?)\s*(PI|UN?|PCS?|KG|L|ML|G)\b/i);
+        if (unitMatch) {
+          const q = parseInt(unitMatch[1]);
+          if (q >= 1 && q <= 99) {
+            qty = q;
+            unitCode = unitMatch[2].toUpperCase();
+            break;
+          }
+        }
+      }
+
+      result.lines.push({
+        ref: mainRef,
+        designation: designation || `Pièce ${mainRef}`,
+        qty: qty,
+        unit: unitCode,
+        priceHT: priceHT,
+        totalHT: priceHT ? priceHT * qty : null,
+        crossRefs: otherRefs.length > 0 ? otherRefs : undefined
+      });
+      console.log('[parseBL][SECOURS] Pièce:', { ref: mainRef, designation, qty, priceHT, crossRefs: otherRefs });
+    }
+  }
+
+  // ============================================================
   // 5) === TOTAL HT / TVA / TTC ===
   // ============================================================
   const totalHTMatch = text.match(/TOTAL\s*H\.?T\.?\s*[:\.]?\s*(\d+[,\.]\d{2})/i);
@@ -10028,7 +10206,14 @@ function blManualFill() {
   console.log('[BL] Parsé:', parsed);
 
   if (!parsed.lines || parsed.lines.length === 0) {
-    showToast('⚠ Aucune pièce détectée dans le BL. Vérifiez le format du texte.', true);
+    // Message d'aide détaillé selon ce qui a été détecté
+    let hint = '⚠ Aucune pièce détectée dans ce BL.';
+    if (parsed.supplier) {
+      hint += `\n\n✓ Fournisseur reconnu : ${parsed.supplier}`;
+    }
+    hint += '\n\n💡 Conseil : avec Google Lens, sélectionnez bien la PARTIE TABLEAU du BL (lignes avec référence, désignation, quantité et prix), pas seulement l\'en-tête avec l\'adresse de la société.';
+    showToast(hint, true);
+    console.warn('[BL] Texte non reconnu. Lignes analysées:', text.split('\n').length);
     return;
   }
 
@@ -10179,6 +10364,10 @@ function fillStockFromBLLine(line, parsed) {
       notes.push(`💶 PU HT : ${line.priceHT.toFixed(2)} € × ${line.qty} = ${(line.priceHT * line.qty).toFixed(2)} € HT`);
     }
     if (parsed.totalTTC) notes.push(`💰 Total BL TTC : ${parsed.totalTTC.toFixed(2)} €`);
+    // Références équivalentes détectées (ex: 318566037 pour GETR318566037)
+    if (line.crossRefs && line.crossRefs.length > 0) {
+      notes.push(`🔄 Autres réf. sur le BL : ${line.crossRefs.join(', ')}`);
+    }
     notes.push('');
     notes.push(`📝 Texte original BL :`);
     notes.push(parsed.rawText.substring(0, 400));
